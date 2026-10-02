@@ -25,7 +25,7 @@
                         {% csrf_token %}
                         <div class="input-group">
                             <input type="text" class="form-control" placeholder="Username" name="username" >
-                            <input type="password" class="form-control" placeholder="Username" name="psw" >
+                            <input type="password" class="form-control" placeholder="Password" name="psw" >
                             <button class="btn btn-primary" type="submit">Login</button>
                             <a class="btn btn-link" href="{% url 'onlinecourse:registration' %}">Sign Up</a>
                         </div>
@@ -42,7 +42,7 @@
             <div class="card-deck">
                 {% for course in course_list %}
                          <div class="card" style="width: 36rem;">
-                          <img class="card-img-left" src="{{MEDIA_URL}}/{{ course.image }}" width="240px" height="240px"
+                          <img class="card-img-left" src="{{MEDIA_URL}}{{ course.image }}" width="240px" height="240px"
                                alt="Course image">
                           <div class="card-body bg-light">
                               <h5 class="card-title">{{ course.name }}, <span class="text-success">

@@ -1,7 +1,10 @@
 from django.shortcuts import render
-from django.http import HttpResponseRedirect
+from django.http import HttpResponseRedirect, HttpResponseBadRequest
+from django.contrib.auth.decorators import login_required
+from django.views.decorators.http import require_POST
+from django.db import transaction
 # <HINT> Import any new Models here
-from .models import Course, Enrollment
+from .models import Course, Enrollment, Question, Choice, Submission
 from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404, render, redirect
 from django.urls import reverse
@@ -14,36 +17,30 @@ logger = logging.getLogger(__name__)
 
 
 def registration_request(request):
+    from django.contrib.auth.forms import UserCreationForm
     context = {}
-    if request.method == 'GET':
-        return render(request, 'onlinecourse/user_registration_bootstrap.html', context)
-    elif request.method == 'POST':
-        # Check if user exists
-        username = request.POST['username']
-        password = request.POST['psw']
-        first_name = request.POST['firstname']
-        last_name = request.POST['lastname']
-        user_exist = False
-        try:
-            User.objects.get(username=username)
-            user_exist = True
-        except:
-            logger.error("New user")
-        if not user_exist:
-            user = User.objects.create_user(username=username, first_name=first_name, last_name=last_name,
-                                            password=password)
+    if request.method == 'POST':
+        form = UserCreationForm({
+            'username': request.POST.get('username', ''),
+            'password1': request.POST.get('psw', ''),
+            'password2': request.POST.get('psw', ''),
+        })
+        if form.is_valid():
+            user = form.save(commit=False)
+            user.first_name = request.POST.get('firstname', '')[:150]
+            user.last_name = request.POST.get('lastname', '')[:150]
+            user.save()
             login(request, user)
-            return redirect("onlinecourse:index")
-        else:
-            context['message'] = "User already exists."
-            return render(request, 'onlinecourse/user_registration_bootstrap.html', context)
+            return redirect('onlinecourse:index')
+        context['message'] = ' '.join(error for errors in form.errors.values() for error in errors)
+    return render(request, 'onlinecourse/user_registration_bootstrap.html', context)
 
 
 def login_request(request):
     context = {}
     if request.method == "POST":
-        username = request.POST['username']
-        password = request.POST['psw']
+        username = request.POST.get('username', '')
+        password = request.POST.get('psw', '')
         user = authenticate(username=username, password=password)
         if user is not None:
             login(request, user)
@@ -88,49 +85,68 @@ class CourseDetailView(generic.DetailView):
     model = Course
     template_name = 'onlinecourse/course_detail_bootstrap.html'
 
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['is_enrolled'] = check_if_enrolled(self.request.user, self.object)
+        return context
 
+
+@login_required
+@require_POST
+@transaction.atomic
 def enroll(request, course_id):
+    from django.db.models import F
     course = get_object_or_404(Course, pk=course_id)
-    user = request.user
-
-    is_enrolled = check_if_enrolled(user, course)
-    if not is_enrolled and user.is_authenticated:
-        # Create an enrollment
-        Enrollment.objects.create(user=user, course=course, mode='honor')
-        course.total_enrollment += 1
-        course.save()
-
-    return HttpResponseRedirect(reverse(viewname='onlinecourse:course_details', args=(course.id,)))
+    enrollment, created = Enrollment.objects.get_or_create(
+        user=request.user, course=course, defaults={'mode': 'honor'})
+    if created:
+        Course.objects.filter(pk=course.id).update(total_enrollment=F('total_enrollment') + 1)
+    return redirect('onlinecourse:course_details', course.id)
 
 
-# <HINT> Create a submit view to create an exam submission record for a course enrollment,
-# you may implement it based on following logic:
-         # Get user and course object, then get the associated enrollment object created when the user enrolled the course
-         # Create a submission object referring to the enrollment
-         # Collect the selected choices from exam form
-         # Add each selected choice object to the submission object
-         # Redirect to show_exam_result with the submission id
-#def submit(request, course_id):
-
-
-# An example method to collect the selected choices from the exam form from the request object
 def extract_answers(request):
-   submitted_anwsers = []
-   for key in request.POST:
-       if key.startswith('choice'):
-           value = request.POST[key]
-           choice_id = int(value)
-           submitted_anwsers.append(choice_id)
-   return submitted_anwsers
+    answers = set()
+    for key in request.POST:
+        if key.startswith('choice'):
+            for value in request.POST.getlist(key):
+                answers.add(int(value))
+    return answers
 
 
-# <HINT> Create an exam result view to check if learner passed exam and show their question results and result for each question,
-# you may implement it based on the following logic:
-        # Get course and submission based on their ids
-        # Get the selected choice ids from the submission record
-        # For each selected choice, check if it is a correct answer or not
-        # Calculate the total score
-#def show_exam_result(request, course_id, submission_id):
+@login_required
+@require_POST
+@transaction.atomic
+def submit(request, course_id):
+    course = get_object_or_404(Course, pk=course_id)
+    enrollment = get_object_or_404(Enrollment, user=request.user, course=course)
+    try:
+        selected_ids = extract_answers(request)
+    except (ValueError, TypeError):
+        return HttpResponseBadRequest('Invalid choice identifier.')
+    choices = Choice.objects.filter(question__course=course, id__in=selected_ids)
+    if choices.count() != len(selected_ids):
+        return HttpResponseBadRequest('A choice does not belong to this course.')
+    submission = Submission.objects.create(enrollment=enrollment)
+    submission.choices.set(choices)
+    return redirect('onlinecourse:show_exam_result', course_id, submission.id)
 
 
-
+@login_required
+def show_exam_result(request, course_id, submission_id):
+    course = get_object_or_404(Course, pk=course_id)
+    submission = get_object_or_404(
+        Submission, pk=submission_id,
+        enrollment__course=course, enrollment__user=request.user)
+    selected_ids = set(submission.choices.values_list('id', flat=True))
+    results, earned, possible = [], 0, 0
+    for question in course.question_set.prefetch_related('choice_set').all():
+        correct = question.is_get_score(selected_ids)
+        earned += question.grade if correct else 0
+        possible += question.grade
+        results.append({'question': question, 'correct': correct,
+                        'choices': question.choice_set.all()})
+    grade = round(100 * earned / possible, 2) if possible else 0
+    return render(request, 'onlinecourse/exam_result_bootstrap.html', {
+        'course': course, 'submission': submission, 'grade': grade,
+        'earned': earned, 'possible': possible, 'passed': grade > 80,
+        'selected_ids': selected_ids, 'results': results})
